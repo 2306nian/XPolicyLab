@@ -87,6 +87,31 @@ Environment variables used by the adapter scripts:
 
 ## Inference Sampling Capabilities
 
+### Multi-environment default inference
+
+`update_obs_batch` stores observations with distinct `env_idx` identities.
+`get_action_batch(env_idx_list)` selects/reorders those rows and performs one
+batched `Policy.infer` call, rather than one call per environment. Multi-env
+requests support default sampling only; conditioned/multi-sample modes fail
+explicitly. Single-env requests retain the existing sampling interface.
+
+Optional noise is `[B, action_horizon, action_dim]` in requested-env order.
+Empty requests return no actions; unknown/duplicate identities, malformed noise
+and invalid/nonfinite model outputs are rejected. Batch shape changes can alter
+BF16 kernel rounding and RNG consumption; this does not promise bitwise equality
+with independently sampled single-env calls.
+
+The optional deployment key `warmup_batch_sizes: [1, 2, 3, 4]` compiles these
+shapes before serving, then restores the evaluation RNG and observation state.
+`policy_timing.infer_ms` now includes device-to-host synchronization, reported by
+`includes_device_to_host: true`.
+
+CPU adapter regression (NumPy, Torch and einops; no checkpoint required):
+
+```bash
+python tests/unit/test_pi05_true_batch_adapter.py -v
+```
+
 The adapter implements the following WebSocket sampling modes. The handshake reports
 only modes available for the loaded backend: PyTorch exposes `default`; JAX exposes
 `default`, `rtc`, `aac` and `paint`, plus `autohorizon` with at least three denoising

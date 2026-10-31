@@ -28,7 +28,9 @@ def _parse_image(image) -> np.ndarray:
     image = np.asarray(image)
     if np.issubdtype(image.dtype, np.floating):
         image = (255 * image).astype(np.uint8)
-    if image.shape[0] == 3:
+    if image.ndim == 4 and image.shape[1] == 3:
+        image = einops.rearrange(image, "b c h w -> b h w c")
+    elif image.ndim == 3 and image.shape[0] == 3:
         image = einops.rearrange(image, "c h w -> h w c")
     return image
 
@@ -40,6 +42,7 @@ class YamInputs(transforms.DataTransformFn):
     model_type: _model.ModelType
 
     def __call__(self, data: dict) -> dict:
+        mask = np.ones(np.asarray(data["observation/state"]).shape[:-1], dtype=bool)
         inputs = {
             "state": data["observation/state"],
             "image": {
@@ -48,9 +51,9 @@ class YamInputs(transforms.DataTransformFn):
                 "right_wrist_0_rgb": _parse_image(data["observation/right_wrist"]),
             },
             "image_mask": {
-                "base_0_rgb": np.True_,
-                "left_wrist_0_rgb": np.True_,
-                "right_wrist_0_rgb": np.True_,
+                "base_0_rgb": mask.copy(),
+                "left_wrist_0_rgb": mask.copy(),
+                "right_wrist_0_rgb": mask.copy(),
             },
         }
         if "actions" in data:

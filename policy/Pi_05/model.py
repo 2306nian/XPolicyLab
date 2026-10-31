@@ -188,6 +188,17 @@ class Model(ModelTemplate):
         self.policy = self.get_model(model_cfg=model_cfg)
         self.policy.reset_rng(self.inference_seed)
         self.model = self.policy
+        warmup_sizes = model_cfg.get("warmup_batch_sizes", [])
+        if warmup_sizes:
+            if self.observation_profile != "aloha" or self.robot_action_dim is None:
+                raise ValueError("batch warmup requires an explicit ALOHA robot configuration")
+            observation = {
+                "state": np.zeros(self.robot_action_dim, dtype=np.float32),
+                "images": {name: np.zeros((3, 224, 224), dtype=np.uint8) for name in
+                           ("cam_high", "cam_left_wrist", "cam_right_wrist")},
+                "instruction": "Warm up the policy.",
+            }
+            self.warmup([observation], warmup_sizes)
 
     def get_model(self, model_cfg: dict[str, Any]):
         repo_id = model_cfg.get("repo_id", "1118")
@@ -318,9 +329,11 @@ class Model(ModelTemplate):
         self.update_obs_batch([obs])
 
     def update_obs_batch(self, obs_list):
-        self._latest_env_idx_list = [
+        env_ids = [
             obs.get("env_idx", index) for index, obs in enumerate(obs_list)
         ]
+        if not env_ids or len(set(env_ids)) != len(env_ids):
+            raise ValueError("observations must have nonempty, distinct environment IDs")
         encoded_obs_list = [
             encode_obs(
                 obs,
@@ -331,6 +344,7 @@ class Model(ModelTemplate):
             for obs in obs_list
         ]
         self.observation_window = stack_obs(encoded_obs_list)
+        self._latest_env_idx_list = env_ids
 
     def get_action(self, **kwargs):
         kwargs.setdefault("num_steps", self.num_steps)
@@ -508,13 +522,40 @@ class Model(ModelTemplate):
         if self.observation_window is None:
             raise AssertionError("update_obs or update_obs_batch first!")
 
-        env_idx_list = env_idx_list or self._latest_env_idx_list
-        # actions = self.policy.infer(self.observation_window, **kwargs)["actions"]
+        env_idx_list = list(self._latest_env_idx_list if env_idx_list is None else env_idx_list)
+        if len(set(env_idx_list)) != len(env_idx_list):
+            raise ValueError("requested environment IDs must be distinct")
+        if not env_idx_list:
+            return []
+        positions = {env_id: i for i, env_id in enumerate(self._latest_env_idx_list)}
+        missing = set(env_idx_list) - positions.keys()
+        if missing:
+            raise ValueError(f"no observation for environment IDs: {sorted(missing)}")
+        observations = [slice_stacked_obs(self.observation_window, positions[i]) for i in env_idx_list]
+        kwargs.setdefault("num_steps", self.num_steps)
+        noise = kwargs.get("noise")
+        if noise is not None:
+            noise = np.asarray(noise)
+            if len(observations) == 1 and noise.shape == (self.action_horizon, self.action_dim):
+                noise = noise[None]
+            if noise.shape != (len(observations), self.action_horizon, self.action_dim):
+                raise ValueError("noise must contain one [horizon, action_dim] row per requested environment")
+            kwargs["noise"] = noise if len(observations) > 1 else noise[0]
+        if len(observations) == 1:
+            # Retain the single-observation API, including conditioned sampling.
+            batched_actions = [self.policy.infer(observations[0], **kwargs)["actions"]]
+        else:
+            if (kwargs.get("num_samples", 1) != 1 or kwargs.get("autohorizon", False)
+                    or kwargs.get("action_condition") is not None
+                    or kwargs.get("paint_action_condition") is not None):
+                raise ValueError("multi-environment inference supports default sampling only")
+            batched_actions = np.asarray(self.policy.infer(stack_obs(observations), **kwargs)["actions"])
+            if batched_actions.ndim != 3 or batched_actions.shape[:2] != (len(observations), self.action_horizon):
+                raise ValueError(f"invalid batched action shape: {batched_actions.shape}")
         action_list = []
-
-        for batch_index, _ in enumerate(env_idx_list):
-            single_observation = slice_stacked_obs(self.observation_window, batch_index)
-            actions = self.policy.infer(single_observation, **kwargs)["actions"]
+        for actions in batched_actions:
+            if not np.isfinite(actions).all():
+                raise ValueError("policy returned non-finite actions")
             if self.robot_action_dim_info is None:
                 action_list.append(actions)
             else:
@@ -528,6 +569,25 @@ class Model(ModelTemplate):
                 )
 
         return action_list
+
+    def warmup(self, obs_list, batch_sizes):
+        """Compile requested batch shapes without advancing the evaluation RNG."""
+        sizes = list(batch_sizes)
+        if not sizes or any(type(n) is not int or not 1 <= n <= 4 for n in sizes):
+            raise ValueError("warmup batch sizes must be integers in [1, 4]")
+        old_window, old_ids = self.observation_window, self._latest_env_idx_list
+        pytorch = self.policy._is_pytorch_model
+        rng = self.policy._torch_generator.get_state() if pytorch else self.policy._rng
+        try:
+            for size in sorted(set(sizes)):
+                self.update_obs_batch([{**obs_list[i % len(obs_list)], "env_idx": i} for i in range(size)])
+                self.get_action_batch(noise=np.zeros((size, self.action_horizon, self.action_dim), dtype=np.float32))
+        finally:
+            if pytorch:
+                self.policy._torch_generator.set_state(rng)
+            else:
+                self.policy._rng = rng
+            self.observation_window, self._latest_env_idx_list = old_window, old_ids
 
     def reset(self):
         self.policy.reset_rng(self.inference_seed)

@@ -281,7 +281,6 @@ class Policy(BasePolicy):
             "state": output_state,
             "actions": actions,
         }
-        model_time = time.monotonic() - start_time
         if self._is_pytorch_model:
             if not is_batched:
                 outputs = jax.tree.map(lambda x: np.asarray(x[0, ...].detach().cpu()), outputs)
@@ -292,9 +291,12 @@ class Policy(BasePolicy):
         else:
             outputs = jax.tree.map(np.asarray, outputs)
 
+        # Host conversion waits for device completion; dispatch alone is asynchronous.
+        model_time = time.monotonic() - start_time
         outputs = self._output_transform(outputs)
         outputs["policy_timing"] = {
             "infer_ms": model_time * 1000,
+            "includes_device_to_host": True,
         }
         if autohorizon_metadata is not None:
             outputs["autohorizon"] = autohorizon_metadata
